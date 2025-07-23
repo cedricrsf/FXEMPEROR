@@ -1,0 +1,1682 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, query, orderBy, onSnapshot, addDoc, updateDoc, doc, getDocs, setDoc } from 'firebase/firestore';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
+
+// Variables globales fournies par l'environnement Canvas
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Valeurs par défaut pour les paramètres
+const DEFAULT_INITIAL_CAPITAL = 0;
+const DEFAULT_TARGET_CAPITAL = 0;
+const DEFAULT_FIXED_MONTHLY_INCOME = 0;
+const DEFAULT_FIXED_MONTHLY_EXPENSE = 0;
+
+
+// Initialiser Firebase en dehors du composant pour éviter les réinitialisations
+let app, db, auth;
+try {
+    app = initializeApp(firebaseConfig);
+    db = getFirestore(app);
+    auth = getAuth(app);
+} catch (error) {
+    console.error("Erreur lors de l'initialisation de Firebase:", error);
+    app = null;
+    db = null;
+    auth = null;
+}
+
+// Listes d'actifs pour le journal de trading
+const ASSET_SYMBOLS = {
+    Forex: [
+        'EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'USD/CAD', 'USD/CHF', 'NZD/USD', 'EUR/GBP'
+    ],
+    Crypto: [
+        'BTC/USD', 'ETH/USD', 'XRP/USD', 'ADA/USD', 'SOL/USD', 'DOGE/USD'
+    ],
+    'Matières Premières': [
+        'Gold', 'Silver', 'Crude Oil', 'Natural Gas', 'Copper', 'Platinum'
+    ]
+};
+
+// Helper function to format numbers with dot as thousand separator and 'Ar' currency
+const formatMGA = (amount) => {
+    if (typeof amount !== 'number' || isNaN(amount)) {
+        return '0 Ar'; // Default for non-numeric or NaN values
+    }
+    // Use 'fr-MG' locale to get the correct number formatting (space for thousands)
+    // Then replace the non-breaking space (\u00A0) with a dot
+    return amount.toLocaleString('fr-MG', {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 2
+    }).replace(/\u00A0/g, '.') + ' Ar';
+};
+
+
+// Composant pour le widget TradingView
+const TradingChartWidget = ({ symbol, isDarkMode }) => {
+    const chartContainerRef = useRef(null);
+    const widgetId = `tradingview_widget_container_${symbol.replace('/', '_')}`; // Unique ID for each widget
+
+    // Définir initializeWidget à l'extérieur de useEffect pour éviter les problèmes de référence
+    const initializeWidget = () => {
+        if (!chartContainerRef.current) return;
+
+        // S'assurer que le conteneur est vide avant de créer un nouveau widget
+        chartContainerRef.current.innerHTML = '';
+
+        const widgetOptions = {
+            "autosize": true,
+            "symbol": symbol,
+            "interval": "D",
+            "timezone": "Etc/UTC",
+            "theme": isDarkMode ? "dark" : "light",
+            "style": "1",
+            "locale": "fr",
+            "toolbar_bg": isDarkMode ? "#1A1A1A" : "#FFFFFF", // Thème plus minimaliste: presque noir pour sombre, blanc pur pour clair
+            "enable_publishing": false,
+            "hide_side_toolbar": false,
+            "allow_symbol_change": true,
+            "container_id": widgetId, // Utiliser l'ID unique
+            "withdateranges": true,
+            "range": "1M",
+            "save_image": false,
+            "details": true,
+            "hotlist": false,
+            "calendar": false,
+            "studies": [
+                "STD;EMA"
+            ],
+            "show_popup_button": true,
+            "popup_width": "1000",
+            "popup_height": "650"
+        };
+
+        // Créer un nouveau widget
+        new window.TradingView.widget(widgetOptions);
+    };
+
+    useEffect(() => {
+        // Charger le script TradingView s'il n'est pas déjà chargé
+        if (typeof window.TradingView === 'undefined') {
+            const script = document.createElement('script');
+            script.src = 'https://s3.tradingview.com/tv.js';
+            script.async = true;
+            script.onload = () => {
+                // Une fois le script chargé, nous pouvons initialiser le widget
+                initializeWidget();
+            };
+            document.head.appendChild(script);
+        } else {
+            // Si le script est déjà chargé, initialiser simplement le widget
+            initializeWidget();
+        }
+
+        return () => {
+            // Nettoyer le widget lorsque le composant est démonté ou que le symbole/thème change
+            const existingWidget = document.getElementById(widgetId);
+            if (existingWidget && existingWidget.innerHTML !== '') {
+                existingWidget.innerHTML = '';
+            }
+        };
+    }, [symbol, isDarkMode, widgetId]); // Réexécuter l'effet si le symbole ou le thème change
+
+    return (
+        <div className="w-full h-96"> {/* Hauteur fixe pour le graphique */}
+            <div id={widgetId} ref={chartContainerRef} className="w-full h-full rounded-lg overflow-hidden"></div>
+        </div>
+    );
+};
+
+
+const App = () => {
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [dailyEntries, setDailyEntries] = useState([]);
+    const [investments, setInvestments] = useState([]);
+    const [trades, setTrades] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [showModal, setShowModal] = useState(false);
+    const [modalMessage, setModalMessage] = useState('');
+    const [isDarkMode, setIsDarkMode] = useState(false);
+    const [showAllSections, setShowAllSections] = useState(false); // New state for initial view
+
+    // États pour le capital initial et l'objectif
+    const [initialCapital, setInitialCapital] = useState(DEFAULT_INITIAL_CAPITAL);
+    const [targetCapital, setTargetCapital] = useState(DEFAULT_TARGET_CAPITAL);
+
+    // États pour les revenus et dépenses mensuels fixes
+    const [fixedMonthlyIncome, setFixedMonthlyIncome] = useState(DEFAULT_FIXED_MONTHLY_INCOME);
+    const [fixedMonthlyExpense, setFixedMonthlyExpense] = useState(DEFAULT_FIXED_MONTHLY_EXPENSE);
+
+    // États liés à l'IA
+    const [incomeIdeasLoading, setIncomeIdeasLoading] = useState(false);
+    const [incomeIdeasResponse, setIncomeIdeasResponse] = useState('');
+    const [investmentAdviceLoading, setInvestmentAdviceLoading] = useState(false);
+    const [investmentAdviceResponse, setInvestmentAdviceResponse] = '';
+    const [tradeAnalysisLoading, setTradeAnalysisLoading] = useState(false);
+    const [tradeAnalysisResponse, setTradeAnalysisResponse] = '';
+
+    // États des formulaires pour l'entrée quotidienne
+    const [entryDate, setEntryDate] = useState(new Date().toISOString().slice(0, 10));
+    const [incomeAmount, setIncomeAmount] = useState('');
+    const [incomeCategory, setIncomeCategory] = useState('');
+    const [expenseAmount, setExpenseAmount] = useState('');
+    const [expenseCategory, setExpenseCategory] = useState('');
+
+    // États des formulaires pour l'investissement
+    const [investmentAsset, setInvestmentAsset] = useState('');
+    const [investedAmount, setInvestedAmount] = useState('');
+
+    // Nouveaux états des formulaires pour le journal de trading
+    const [tradeAssetType, setTradeAssetType] = useState('CFD');
+    const [tradeSymbol, setTradeSymbol] = useState(ASSET_SYMBOLS.Forex[0]);
+    const [tradeAmount, setTradeAmount] = useState(''); // Changed from tradeProfitLoss
+    const [tradeType, setTradeType] = useState('profit'); // New state: 'profit' or 'loss'
+    const [tradeQuantity, setTradeQuantity] = useState('');
+    const [tradeDate, setTradeDate] = useState(new Date().toISOString().slice(0, 10));
+    const [tradeNotes, setTradeNotes] = useState('');
+
+    // États pour les sections dépliables
+    const [openSections, setOpenSections] = useState({
+        overview: true, // Ouvrir la première section par default
+        cashFlow: false,
+        investments: false,
+        trading: false,
+        aiTools: false,
+    });
+
+    // Références pour le défilement (scroll)
+    const dailyEntriesRef = useRef(null);
+    const tradesRef = useRef(null);
+
+    // Authentification Firebase et chargement des données
+    useEffect(() => {
+        if (!auth || !db) {
+            setError("Firebase n'est pas initialisé. Vérifiez la configuration.");
+            setLoading(false);
+            return;
+        }
+
+        const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                setUserId(user.uid);
+                setIsAuthReady(true);
+            } else {
+                try {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                } catch (err) {
+                    console.error("Erreur d'authentification Firebase:", err);
+                    setError("Échec de l'authentification. Veuillez réessayer.");
+                    setIsAuthReady(true);
+                }
+            }
+        });
+
+        return () => unsubscribeAuth();
+    }, []);
+
+    // Écouteur de données Firestore
+    useEffect(() => {
+        if (!isAuthReady || !userId || !db) {
+            return;
+        }
+
+        const dailyEntriesCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/daily_entries`);
+        const investmentsCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/investments`);
+        const tradesCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/trades`);
+        const appSettingsDocRef = doc(db, `artifacts/${appId}/users/${userId}/settings/app_settings`);
+        const fixedMonthlyDataDocRef = doc(db, `artifacts/${appId}/users/${userId}/settings/fixed_monthly_data`);
+
+        // Charger les paramètres généraux (capital initial, objectif)
+        const unsubscribeAppSettings = onSnapshot(appSettingsDocRef, (docSnap) => {
+            if (docSnap.exists()) {
+                const settings = docSnap.data();
+                setInitialCapital(parseFloat(settings.initialCapital) || DEFAULT_INITIAL_CAPITAL);
+                setTargetCapital(parseFloat(settings.targetCapital) || DEFAULT_TARGET_CAPITAL);
+            }
+        }, (err) => {
+            console.error("Erreur lors du chargement des paramètres de l'application:", err);
+            setError("Échec du chargement des paramètres de l'application.");
+        });
+
+        // Charger les données mensuelles fixes
+        const unsubscribeFixedMonthlyData = onSnapshot(fixedMonthlyDataDocRef, (docSnap) => {
+            if (docSnap.exists()) {
+                const data = docSnap.data();
+                setFixedMonthlyIncome(parseFloat(data.fixedMonthlyIncome) || DEFAULT_FIXED_MONTHLY_INCOME);
+                setFixedMonthlyExpense(parseFloat(data.fixedMonthlyExpense) || DEFAULT_FIXED_MONTHLY_EXPENSE);
+            }
+        }, (err) => {
+            console.error("Erreur lors du chargement des données mensuelles fixes:", err);
+            setError("Échec du chargement des données mensuelles fixes.");
+        });
+
+        const unsubscribeDaily = onSnapshot(query(dailyEntriesCollectionRef, orderBy('date')), (snapshot) => {
+            const entries = snapshot.docs.map(doc => ({
+                id: doc.id,
+                date: doc.data().date,
+                income: parseFloat(doc.data().income) || 0,
+                incomeCategory: doc.data().incomeCategory,
+                expense: parseFloat(doc.data().expense) || 0,
+                expenseCategory: doc.data().expenseCategory,
+                timestamp: doc.data().timestamp
+            }));
+            setDailyEntries(entries);
+            setLoading(false);
+        }, (err) => {
+            console.error("Erreur lors du chargement des entrées quotidiennes:", err);
+            setError("Échec du chargement des données quotidiennes.");
+            setLoading(false);
+        });
+
+        const unsubscribeInvestments = onSnapshot(investmentsCollectionRef, (snapshot) => {
+            const invs = snapshot.docs.map(doc => ({
+                id: doc.id,
+                assetName: doc.data().assetName,
+                totalInvested: parseFloat(doc.data().totalInvested) || 0,
+                timestamp: doc.data().timestamp
+            }));
+            setInvestments(invs);
+        }, (err) => {
+            console.error("Erreur lors du chargement des investissements:", err);
+            setError("Échec du chargement des données d'investissement.");
+        });
+
+        // Écouteur pour les trades
+        const unsubscribeTrades = onSnapshot(query(tradesCollectionRef, orderBy('tradeDate', 'desc')), (snapshot) => {
+            const tradeList = snapshot.docs.map(doc => ({
+                id: doc.id,
+                assetType: doc.data().assetType,
+                symbol: doc.data().symbol,
+                quantity: parseFloat(doc.data().quantity) || 0,
+                profitLoss: parseFloat(doc.data().profitLoss) || 0,
+                tradeDate: doc.data().tradeDate,
+                notes: doc.data().notes,
+                timestamp: doc.data().timestamp
+            }));
+            setTrades(tradeList);
+        }, (err) => {
+            console.error("Erreur lors du chargement des trades:", err);
+            setError("Échec du chargement des données de trading.");
+        });
+
+
+        return () => {
+            unsubscribeAppSettings();
+            unsubscribeFixedMonthlyData();
+            unsubscribeDaily();
+            unsubscribeInvestments();
+            unsubscribeTrades();
+        };
+    }, [isAuthReady, userId, db]);
+
+    // Défilement vers le bas des entrées quotidiennes lorsque de nouvelles données arrivent
+    useEffect(() => {
+        if (dailyEntriesRef.current) {
+            dailyEntriesRef.current.scrollTop = dailyEntriesRef.current.scrollHeight;
+        }
+    }, [dailyEntries]);
+
+    // Défilement vers le haut des trades lorsque de nouvelles données arrivent
+    useEffect(() => {
+        if (tradesRef.current) {
+            tradesRef.current.scrollTop = 0; // Scroll to top for latest trades
+        }
+    }, [trades]);
+
+    const showMessageModal = (message) => {
+        setModalMessage(message);
+        setShowModal(true);
+        setTimeout(() => setShowModal(false), 3000);
+    };
+
+    // Fonction pour sauvegarder les paramètres généraux (capital initial, objectif)
+    const saveAppSettings = async (initialCap, targetCap) => {
+        if (!userId || !db) {
+            showMessageModal("Erreur: Utilisateur non authentifié ou Firebase non initialisé.");
+            return;
+        }
+        const appSettingsDocRef = doc(db, `artifacts/${appId}/users/${userId}/settings/app_settings`);
+        try {
+            await setDoc(appSettingsDocRef, {
+                initialCapital: parseFloat(initialCap) || 0,
+                targetCapital: parseFloat(targetCap) || 0
+            }, { merge: true });
+        } catch (err) {
+            console.error("Erreur lors de la sauvegarde des paramètres de l'application:", err);
+            showMessageModal("Erreur lors de la sauvegarde des paramètres de l'application.");
+        }
+    };
+
+    // Fonction pour sauvegarder les données mensuelles fixes
+    const saveFixedMonthlyData = async (fixedIncome, fixedExpense) => {
+        if (!userId || !db) {
+            showMessageModal("Erreur: Utilisateur non authentifié ou Firebase non initialisé.");
+            return;
+        }
+        const fixedMonthlyDataDocRef = doc(db, `artifacts/${appId}/users/${userId}/settings/fixed_monthly_data`);
+        try {
+            await setDoc(fixedMonthlyDataDocRef, {
+                fixedMonthlyIncome: parseFloat(fixedIncome) || 0,
+                fixedMonthlyExpense: parseFloat(fixedExpense) || 0
+            }, { merge: true });
+        } catch (err) {
+            console.error("Erreur lors de la sauvegarde des données mensuelles fixes:", err);
+            showMessageModal("Erreur lors de la sauvegarde des données mensuelles fixes.");
+        }
+    };
+
+    // Fonction pour réinitialiser tous les paramètres à leurs valeurs par défaut
+    const handleResetAllSettings = async () => {
+        if (!userId || !db) {
+            showMessageModal("Erreur: Utilisateur non authentifié ou Firebase non initialisé.");
+            return;
+        }
+        try {
+            await saveAppSettings(DEFAULT_INITIAL_CAPITAL, DEFAULT_TARGET_CAPITAL);
+            await saveFixedMonthlyData(DEFAULT_FIXED_MONTHLY_INCOME, DEFAULT_FIXED_MONTHLY_EXPENSE);
+            showMessageModal("Tous les paramètres ont été réinitialisés aux valeurs par défaut !");
+        } catch (err) {
+            console.error("Erreur lors de la réinitialisation des paramètres:", err);
+            showMessageModal("Erreur lors de la réinitialisation des paramètres.");
+        }
+    };
+
+
+    const handleInitialCapitalChange = (e) => {
+        const value = e.target.value;
+        setInitialCapital(value);
+        clearTimeout(window.initialCapitalTimer);
+        window.initialCapitalTimer = setTimeout(() => saveAppSettings(value, targetCapital), 1000);
+    };
+
+    const handleTargetCapitalChange = (e) => {
+        const value = e.target.value;
+        setTargetCapital(value);
+        clearTimeout(window.targetCapitalTimer);
+        window.targetCapitalTimer = setTimeout(() => saveAppSettings(initialCapital, value), 1000);
+    };
+
+    const handleFixedMonthlyIncomeChange = (e) => {
+        const value = e.target.value;
+        setFixedMonthlyIncome(value);
+        clearTimeout(window.fixedIncomeTimer);
+        window.fixedIncomeTimer = setTimeout(() => saveFixedMonthlyData(value, fixedMonthlyExpense), 1000);
+    };
+
+    const handleFixedMonthlyExpenseChange = (e) => {
+        const value = e.target.value;
+        setFixedMonthlyExpense(value);
+        clearTimeout(window.fixedExpenseTimer);
+        window.fixedExpenseTimer = setTimeout(() => saveFixedMonthlyData(fixedMonthlyIncome, value), 1000);
+    };
+
+    const handleAddDailyEntry = async (e) => {
+        e.preventDefault();
+        if (!userId || !db) {
+            showMessageModal("Erreur: Utilisateur non authentifié ou Firebase non initialisé.");
+            return;
+        }
+
+        const entry = {
+            date: entryDate,
+            income: parseFloat(incomeAmount) || 0,
+            incomeCategory: (incomeCategory || '').trim(), // Ensure it's a string before trim
+            expense: parseFloat(expenseAmount) || 0,
+            expenseCategory: (expenseCategory || '').trim(), // Ensure it's a string before trim
+            timestamp: new Date()
+        };
+
+        try {
+            const q = collection(db, `artifacts/${appId}/users/${userId}/daily_entries`);
+            const querySnapshot = await getDocs(q);
+            const existingEntryDoc = querySnapshot.docs.find(doc => doc.data().date === entryDate);
+
+            if (existingEntryDoc) {
+                await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/daily_entries`, existingEntryDoc.id), entry);
+                showMessageModal("Entrée quotidienne mise à jour avec succès !");
+            } else {
+                await addDoc(collection(db, `artifacts/${appId}/users/${userId}/daily_entries`), entry);
+                showMessageModal("Entrée quotidienne ajoutée avec succès !");
+            }
+
+            // Reset form fields
+            setIncomeAmount('');
+            setIncomeCategory('');
+            setExpenseAmount('');
+            setExpenseCategory('');
+            setEntryDate(new Date().toISOString().slice(0, 10));
+        } catch (err) {
+            console.error("Erreur lors de l'ajout/mise à jour de l'entrée quotidienne:", err);
+            showMessageModal("Erreur lors de l'enregistrement de l'entrée.");
+        }
+    };
+
+    const handleAddInvestment = async (e) => {
+        e.preventDefault();
+        if (!userId || !db) {
+            showMessageModal("Erreur: Utilisateur non authentifié ou Firebase non initialisé.");
+            return;
+        }
+
+        const newInvestment = {
+            assetName: (investmentAsset || '').trim(), // Ensure it's a string before trim
+            totalInvested: parseFloat(investedAmount) || 0,
+            timestamp: new Date()
+        };
+
+        if (!newInvestment.assetName) {
+            showMessageModal("Le nom de l'actif d'investissement ne peut pas être vide.");
+            return;
+        }
+
+        try {
+            const existingInvestmentDoc = investments.find(inv => inv.assetName.toLowerCase() === newInvestment.assetName.toLowerCase());
+
+            if (existingInvestmentDoc) {
+                await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/investments`, existingInvestmentDoc.id), newInvestment);
+                showMessageModal("Investissement mis à jour avec succès !");
+            } else {
+                await addDoc(collection(db, `artifacts/${appId}/users/${userId}/investments`), newInvestment);
+                showMessageModal("Investissement ajouté avec succès !");
+            }
+
+            // Reset form fields
+            setInvestmentAsset('');
+            setInvestedAmount('');
+        } catch (err) {
+            console.error("Erreur lors de l'ajout/mise à jour de l'investissement:", err);
+            showMessageModal("Erreur lors de l'enregistrement de l'investissement.");
+        }
+    };
+
+    // Nouvelle fonction pour ajouter un trade
+    const handleAddTrade = async (e) => {
+        e.preventDefault();
+        if (!userId || !db) {
+            showMessageModal("Erreur: Utilisateur non authentifié ou Firebase non initialisé.");
+            return;
+        }
+
+        const amountNum = parseFloat(tradeAmount);
+        const quantityNum = parseFloat(tradeQuantity);
+
+        if (isNaN(amountNum) || isNaN(quantityNum) || quantityNum <= 0) {
+            showMessageModal("Veuillez entrer des valeurs numériques valides pour le montant et la quantité.");
+            return;
+        }
+
+        // Determine the final profitLoss based on tradeType
+        const finalProfitLoss = tradeType === 'loss' ? -Math.abs(amountNum) : Math.abs(amountNum);
+
+        const newTrade = {
+            assetType: tradeAssetType, // Sera toujours 'CFD'
+            symbol: (tradeSymbol || '').trim(), // Ensure it's a string before trim
+            quantity: quantityNum,
+            profitLoss: finalProfitLoss, // Use the calculated finalProfitLoss
+            tradeDate: tradeDate,
+            notes: (tradeNotes || '').trim(), // Ensure it's a string before trim
+            timestamp: new Date()
+        };
+
+        if (!newTrade.symbol) {
+            showMessageModal("Le symbole de l'actif ne peut pas être vide.");
+            return;
+        }
+
+        try {
+            await addDoc(collection(db, `artifacts/${appId}/users/${userId}/trades`), newTrade);
+            showMessageModal("Trade ajouté avec succès !");
+
+            // Réinitialiser le formulaire de trade
+            setTradeSymbol(ASSET_SYMBOLS.Forex[0]); // Réinitialise au premier élément Forex
+            setTradeAmount(''); // Reset tradeAmount
+            setTradeType('profit'); // Reset tradeType to default
+            setTradeQuantity('');
+            setTradeDate(new Date().toISOString().slice(0, 10));
+            setTradeNotes('');
+        } catch (err) {
+            console.error("Erreur lors de l'ajout du trade:", err);
+            showMessageModal("Erreur lors de l'enregistrement du trade.");
+        }
+    };
+
+    // Calculs (utilisant maintenant les états dynamiques)
+    const monthlySummaries = dailyEntries.reduce((acc, entry) => {
+        const month = entry.date.substring(0, 7);
+        if (!acc[month]) {
+            acc[month] = { income: 0, expense: 0, netSavings: 0, tradingProfitLoss: 0 };
+        }
+        acc[month].income += entry.income;
+        acc[month].expense += entry.expense;
+        // netSavings will be calculated later, after adding trading P&L
+        return acc;
+    }, {});
+
+    // Aggregate trading profit/loss by month
+    trades.forEach(trade => {
+        const month = trade.tradeDate.substring(0, 7);
+        if (!monthlySummaries[month]) {
+            monthlySummaries[month] = { income: 0, expense: 0, netSavings: 0, tradingProfitLoss: 0 };
+        }
+        monthlySummaries[month].tradingProfitLoss += trade.profitLoss;
+    });
+
+    // Calculate final netSavings for each month
+    Object.keys(monthlySummaries).forEach(month => {
+        monthlySummaries[month].netSavings =
+            monthlySummaries[month].income -
+            monthlySummaries[month].expense +
+            monthlySummaries[month].tradingProfitLoss;
+    });
+
+
+    // Calculate total amount invested (instead of gain/loss)
+    const totalAmountInvested = investments.reduce((sum, inv) => {
+        return sum + inv.totalInvested;
+    }, 0);
+
+    const totalTradingProfitLoss = trades.reduce((sum, trade) => {
+        return sum + trade.profitLoss;
+    }, 0);
+
+    // Calculate total profits and total losses for the trading bar
+    const totalProfits = trades.reduce((sum, trade) => sum + Math.max(0, trade.profitLoss), 0);
+    const totalLosses = trades.reduce((sum, trade) => sum + Math.abs(Math.min(0, trade.profitLoss)), 0);
+    const absoluteTotalTrading = totalProfits + totalLosses;
+
+    let profitPercentage = 0;
+    let lossPercentage = 0;
+
+    if (absoluteTotalTrading > 0) {
+        profitPercentage = (totalProfits / absoluteTotalTrading) * 100;
+        lossPercentage = (totalLosses / absoluteTotalTrading) * 100;
+    }
+
+
+    const totalNetSavings = Object.values(monthlySummaries).reduce((sum, month) => sum + month.netSavings, 0);
+
+    // Le capital total inclut maintenant les profits/pertes du trading et déduit le montant investi
+    const currentTotalCapital = (parseFloat(initialCapital) || 0) + totalNetSavings - totalAmountInvested; // TotalNetSavings now includes trading P&L
+    const overallProgress = (currentTotalCapital / (parseFloat(targetCapital) || 1)) * 100;
+
+    const estimatedFixedMonthlyNet = (parseFloat(fixedMonthlyIncome) || 0) - (parseFloat(fixedMonthlyExpense) || 0);
+
+    // Préparation des données pour le diagramme de performance des trades
+    const tradePerformanceData = Object.values(trades.reduce((acc, trade) => {
+        if (!acc[trade.symbol]) {
+            acc[trade.symbol] = { symbol: trade.symbol, profitLoss: 0 };
+        }
+        acc[trade.symbol].profitLoss += trade.profitLoss;
+        return acc;
+    }, {}));
+
+    // Calculations for the current month's income/expense bar
+    const today = new Date();
+    const currentYearMonth = today.toISOString().slice(0, 7); // YYYY-MM
+
+    const currentMonthEntries = dailyEntries.filter(entry => entry.date.startsWith(currentYearMonth));
+
+    const currentMonthIncome = currentMonthEntries.reduce((sum, entry) => sum + entry.income, 0);
+    const currentMonthExpense = currentMonthEntries.reduce((sum, entry) => sum + entry.expense, 0);
+
+    const totalCurrentMonthFlow = currentMonthIncome + currentMonthExpense;
+
+    let incomeFlowPercentage = 0;
+    let expenseFlowPercentage = 0;
+
+    if (totalCurrentMonthFlow > 0) {
+        incomeFlowPercentage = (currentMonthIncome / totalCurrentMonthFlow) * 100;
+        expenseFlowPercentage = (currentMonthExpense / totalCurrentMonthFlow) * 100;
+    }
+
+    // Data for the new Global Summary Pie Chart
+    const totalIncomeAllTime = dailyEntries.reduce((sum, entry) => sum + entry.income, 0) + (fixedMonthlyIncome * Object.keys(monthlySummaries).length);
+    const totalExpenseAllTime = dailyEntries.reduce((sum, entry) => sum + entry.expense, 0) + (fixedMonthlyExpense * Object.keys(monthlySummaries).length);
+    const totalTradingProfit = trades.reduce((sum, trade) => sum + Math.max(0, trade.profitLoss), 0);
+    const totalTradingLoss = trades.reduce((sum, trade) => sum + Math.abs(Math.min(0, trade.profitLoss)), 0);
+
+    const pieChartData = [
+        { name: 'Revenus Opérationnels', value: totalIncomeAllTime },
+        { name: 'Dépenses Opérationnelles', value: totalExpenseAllTime },
+        { name: 'Profits de Trading', value: totalTradingProfit },
+        { name: 'Pertes de Trading', value: totalTradingLoss }
+    ].filter(item => item.value > 0); // Filter out zero values for cleaner chart
+
+    const MARVEL_COLORS = [
+        '#00C49F', // Green (Hulk)
+        '#FF4500', // Orange-Red (Iron Man, Scarlet Witch)
+        '#00BFFF', // Deep Sky Blue (Captain America, Thor)
+        '#BA55D3'  // Medium Orchid (Thanos, Mysterio)
+    ];
+
+    // Custom Tooltip for Pie Chart
+    const CustomPieTooltip = ({ active, payload, isDarkMode }) => {
+        if (active && payload && payload.length) {
+            const data = payload[0].payload;
+            return (
+                <div className={`p-3 rounded-lg shadow-md ${isDarkMode ? 'bg-gray-700 text-gray-100' : 'bg-white text-gray-800'}`}>
+                    <p className="font-bold text-lg">{data.name}</p>
+                    <p className="text-sm">{`Valeur: ${formatMGA(data.value)}`}</p>
+                    <p className="text-xs">{`Pourcentage: ${(data.percent * 100).toFixed(2)}%`}</p>
+                </div>
+            );
+        }
+        return null;
+    };
+
+
+    // Appels API LLM
+    const generateIncomeIdeas = async () => {
+        setIncomeIdeasLoading(true);
+        setIncomeIdeasResponse('');
+        try {
+            const prompt = `Given a fixed monthly income of ${formatMGA(fixedMonthlyIncome)}, a fixed monthly expense of ${formatMGA(fixedMonthlyExpense)}, a current total capital of ${formatMGA(currentTotalCapital)}, and a goal of ${formatMGA(targetCapital)} in 12 months, suggest aggressive and high-potential side hustle or income generation ideas suitable for someone with maximum risk tolerance. Focus on ideas that can scale quickly. Provide 3-5 distinct ideas with a brief explanation for each. Respond in French.`;
+            let chatHistory = [];
+            chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+            const payload = { contents: chatHistory };
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const result = await response.json();
+            if (result.candidates && result.candidates.length > 0 &&
+                result.candidates[0].content && result.candidates[0].content.parts &&
+                result.candidates[0].content.parts.length > 0) {
+                const text = result.candidates[0].content.parts[0].text;
+                setIncomeIdeasResponse(text);
+            } else {
+                setIncomeIdeasResponse("Aucune idée générée. Veuillez réessayer.");
+            }
+        } catch (err) {
+            console.error("Erreur lors de la génération d'idées de revenus:", err);
+            setIncomeIdeasResponse("Erreur lors de la génération d'idées. Veuillez vérifier votre connexion.");
+        } finally {
+            setIncomeIdeasLoading(false);
+        }
+    };
+
+    const generateInvestmentAdvice = async () => {
+        setInvestmentAdviceLoading(true);
+        setInvestmentAdviceResponse('');
+        try {
+            const prompt = `Given an initial capital of ${formatMGA(initialCapital)}, a fixed monthly income of ${formatMGA(fixedMonthlyIncome)}, a fixed monthly expense of ${formatMGA(fixedMonthlyExpense)}, a current total capital of ${formatMGA(currentTotalCapital)}, an aggressive goal of ${formatMGA(targetCapital)} in 12 months, and maximum risk tolerance, suggest specific high-risk, high-reward investment strategies or asset classes. Focus on options that could potentially yield very high returns in a short timeframe. Provide 3-5 distinct strategies/assets with a brief explanation for each, emphasizing the high risk involved. Respond in French.`;
+            let chatHistory = [];
+            chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+            const payload = { contents: chatHistory };
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const result = await response.json();
+            if (result.candidates && result.candidates.length > 0 &&
+                result.candidates[0].content && result.candidates[0].content.parts &&
+                result.candidates[0].content.parts.length > 0) {
+                const text = result.candidates[0].content.parts[0].text;
+                setInvestmentAdviceResponse(text);
+            } else {
+                setInvestmentAdviceResponse("Aucun conseil d'investissement généré. Veuillez réessayer.");
+            }
+        } catch (err) {
+            console.error("Erreur lors de la génération de conseils d'investissement:", err);
+            setInvestmentAdviceResponse("Erreur lors de la génération de conseils. Veuillez vérifier votre connexion.");
+        } finally {
+            setInvestmentAdviceLoading(false);
+        }
+    };
+
+    // Nouvelle fonction pour l'analyse de trading par l'IA
+    const generateTradeAnalysis = async () => {
+        setTradeAnalysisLoading(true);
+        setTradeAnalysisResponse('');
+
+        if (trades.length === 0) {
+            setTradeAnalysisResponse("Aucune donnée de trading disponible pour l'analyse. Enregistrez quelques trades d'abord !");
+            setTradeAnalysisLoading(false);
+            return;
+        }
+
+        try {
+            const formattedTrades = trades.map(trade =>
+                `Symbole: ${trade.symbol}, P&L: ${formatMGA(trade.profitLoss)}, Qté: ${trade.quantity}, Date: ${trade.tradeDate}, Notes: ${trade.notes || 'N/A'}`
+            ).join('\n');
+
+            const prompt = `Based on the following trading data for CFD trades, provide a concise summary of the overall performance, identify the best and worst performing symbols, and offer 3-5 general tips for improving trading results. The data includes symbol, quantity, profit/loss, date, and notes for each trade. Respond in French.
+
+Trading Data:
+${formattedTrades}
+
+Total Trading P&L: ${formatMGA(totalTradingProfitLoss)}`;
+
+            let chatHistory = [];
+            chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+            const payload = { contents: chatHistory };
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const result = await response.json();
+            if (result.candidates && result.candidates.length > 0 &&
+                result.candidates[0].content && result.candidates[0].content.parts &&
+                result.candidates[0].content.parts.length > 0) {
+                const text = result.candidates[0].content.parts[0].text;
+                setTradeAnalysisResponse(text);
+            } else {
+                setTradeAnalysisResponse("Aucune analyse de trading générée. Veuillez réessayer.");
+            }
+        } catch (err) {
+            console.error("Erreur lors de la génération de l'analyse de trading:", err);
+            setTradeAnalysisResponse("Erreur lors de la génération de l'analyse. Veuillez vérifier votre connexion.");
+        } finally {
+            setTradeAnalysisLoading(false);
+        }
+    };
+
+    // Fonction pour basculer l'ouverture/fermeture d'une section
+    const toggleSection = (sectionName) => {
+        setOpenSections(prev => ({
+            ...prev,
+            [sectionName]: !prev[sectionName]
+        }));
+    };
+
+
+    // Classes Tailwind CSS dynamiques pour le mode sombre et clair (Minimaliste / Apple-esque)
+    const appBgClass = isDarkMode ? 'bg-gradient-to-br from-gray-950 to-black text-gray-100' : 'bg-gradient-to-br from-white to-gray-50 text-gray-900';
+    const cardBgClass = isDarkMode ? 'bg-gray-800 border-gray-700 shadow-lg' : 'bg-white border-gray-200 shadow-sm';
+    const headerTextColorClass = isDarkMode ? 'text-gray-50' : 'text-gray-900'; // Plus subtil
+    const titleTextColorClass = isDarkMode ? 'text-gray-100' : 'text-gray-900'; // Presque blanc ou noir
+    const labelTextColorClass = isDarkMode ? 'text-gray-400' : 'text-gray-600';
+    const valueTextColorClass = isDarkMode ? 'text-gray-100' : 'text-gray-800';
+    const inputClass = isDarkMode ? 'bg-gray-700 border-gray-600 text-gray-100 placeholder-gray-400 focus:ring-blue-500 focus:border-blue-500' : 'bg-gray-50 border-gray-300 text-gray-900 placeholder-gray-500 focus:ring-blue-600 focus:border-blue-600';
+    const tableHeaderBgClass = isDarkMode ? 'bg-gray-700 text-gray-100' : 'bg-gray-100 text-gray-800';
+    const tableRowBgClass = isDarkMode ? 'bg-gray-800 border-gray-700 hover:bg-gray-700' : 'bg-white border-gray-200 hover:bg-gray-50';
+    const aiResponseBgClass = isDarkMode ? 'bg-gray-700 border-gray-600 text-gray-100' : 'bg-gray-100 border-gray-300 text-gray-800';
+
+    // Boutons avec un accent bleu sophistiqué
+    const buttonPrimaryClass = isDarkMode ? 'bg-blue-600 hover:bg-blue-700 text-white' : 'bg-blue-600 hover:bg-blue-700 text-white';
+    const buttonSecondaryClass = isDarkMode ? 'bg-gray-700 hover:bg-gray-600 text-gray-100' : 'bg-gray-200 hover:bg-gray-300 text-gray-800';
+
+    // Couleurs spécifiques pour les indicateurs de profit/perte et épargne
+    const getProfitLossColorClass = (value) => {
+        if (value >= 0) {
+            return isDarkMode ? 'text-green-400' : 'text-green-600';
+        } else {
+            return isDarkMode ? 'text-red-400' : 'text-red-600';
+        }
+    };
+
+    const getNetSavingsColorClass = (value) => {
+        if (value >= 0) {
+            return isDarkMode ? 'text-blue-300' : 'text-blue-700'; // Bleu pour positif
+        } else {
+            return isDarkMode ? 'text-red-400' : 'text-orange-600'; // Orange/Rouge pour négatif
+        }
+    };
+
+    // Couleurs spécifiques pour les titres de cartes (plus uniformes pour le minimalisme)
+    const cardGreenTitleClass = isDarkMode ? 'text-green-400' : 'text-green-700';
+    const cardPurpleTitleClass = isDarkMode ? 'text-blue-300' : 'text-blue-700'; // Utilisant le bleu d'accent
+    const cardYellowTitleClass = isDarkMode ? 'text-gray-100' : 'text-gray-900'; // Texte normal
+    const cardOrangeTitleClass = isDarkMode ? 'text-blue-300' : 'text-blue-700'; // Utilisant le bleu d'accent
+    const cardTealTitleClass = isDarkMode ? 'text-blue-300' : 'text-blue-700'; // Utilisant le bleu d'accent
+    const cardBlueTitleClass = isDarkMode ? 'text-blue-300' : 'text-blue-700'; // Utilisant le bleu d'accent
+
+    // Couleurs spécifiques pour les valeurs dans la carte Objectif Global
+    const gridValueBlueClass = isDarkMode ? 'text-gray-100' : 'text-gray-900';
+    const gridValueGreenClass = isDarkMode ? 'text-gray-100' : 'text-gray-900';
+    const gridValuePurpleClass = isDarkMode ? 'text-gray-100' : 'text-gray-900';
+
+    // Classes pour le cadre en titane du titre
+    const titaniumFrameClass = isDarkMode
+        ? 'bg-gradient-to-br from-gray-700 via-gray-800 to-gray-900 border border-gray-600 shadow-2xl'
+        : 'bg-gradient-to-br from-gray-200 via-gray-100 to-gray-50 border border-gray-300 shadow-lg';
+    const titaniumTextClass = isDarkMode ? 'text-gray-100 drop-shadow-md' : 'text-gray-900 drop-shadow-sm';
+
+
+    if (loading) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-gray-100 dark:bg-gray-900">
+                <div className="text-xl font-semibold text-gray-700 dark:text-gray-300">Chargement de vos données...</div>
+            </div>
+        );
+    }
+
+    if (error) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-red-100 text-red-700 p-4 rounded-lg dark:bg-red-900 dark:text-red-300">
+                <p>{error}</p>
+            </div>
+        );
+    }
+
+    return (
+        <div className={`min-h-screen font-inter p-4 sm:p-6 lg:p-8 transition-colors duration-300 ${appBgClass} ${!showAllSections ? 'flex flex-col items-center justify-center' : ''}`}>
+            <script src="https://cdn.tailwindcss.com"></script>
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+
+            {/* Global Styles */}
+            <style>{`
+                body { font-family: 'Inter', sans-serif; }
+                .scrollable-table-container {
+                    max-height: 400px;
+                    overflow-y: auto;
+                    border-radius: 0.5rem;
+                    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05); /* Ombre plus douce */
+                }
+                .sticky-header th {
+                    position: sticky;
+                    top: 0;
+                    z-index: 10;
+                }
+                .animate-fade-in-down {
+                    animation: fadeInDown 0.5s ease-out forwards;
+                }
+                @keyframes fadeInDown {
+                    from { opacity: 0; transform: translateY(-20px); }
+                    to { opacity: 1; transform: translateY(0); }
+                }
+                .transition-all {
+                    transition-property: all;
+                    transition-duration: 300ms;
+                    transition-timing-function: ease-in-out;
+                }
+                .collapsible-content {
+                    max-height: 0;
+                    overflow: hidden;
+                    transition: max-height 0.5s ease-out;
+                }
+                .collapsible-content.open {
+                    max-height: 2000px; /* Grande valeur pour permettre l'expansion */
+                }
+                .rotate-90 {
+                    transform: rotate(90deg);
+                }
+            `}</style>
+
+            {/* Modal for messages */}
+            {showModal && (
+                <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center z-50">
+                    <div className="bg-white dark:bg-gray-700 p-6 rounded-lg shadow-xl animate-fade-in-down">
+                        <p className="text-lg font-semibold text-center text-gray-800 dark:text-gray-100">{modalMessage}</p>
+                    </div>
+                </div>
+            )}
+
+            <div className={`flex justify-between items-center p-4 rounded-xl ${titaniumFrameClass} ${!showAllSections ? 'w-full max-w-xl mx-auto mb-0' : 'mb-8'}`}>
+                <h1
+                    className={`text-4xl sm:text-5xl font-extrabold cursor-pointer ${titaniumTextClass} ${!showAllSections ? 'mx-auto' : ''}`}
+                    onClick={() => setShowAllSections(true)}
+                >
+                    FXE EMPIRE BUILDER
+                </h1>
+                {showAllSections && (
+                    <button
+                        onClick={() => setIsDarkMode(!isDarkMode)}
+                        className="p-3 rounded-full bg-gray-100 dark:bg-gray-800 text-gray-800 dark:text-gray-100 shadow-md transition-all duration-300 transform hover:scale-105 hover:shadow-lg active:scale-95 active:brightness-90"
+                        aria-label="Basculer le thème"
+                    >
+                        {isDarkMode ? (
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3v1m0 16v1m9-9h1M4 12H3m15.325 3.325l-.707.707M6.364 6.364l-.707-.707m12.728 0l-.707-.707M6.364 17.636l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+                            </svg>
+                        ) : (
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9 9 0 008.354-5.646z" />
+                            </svg>
+                        )}
+                    </button>
+                )}
+            </div>
+
+            {showAllSections && (
+                <div className="max-w-6xl mx-auto space-y-6 animate-fade-in-down">
+
+                    {/* Section: Vue d'Ensemble Financière */}
+                    <div className={`p-6 rounded-xl shadow-lg border ${cardBgClass}`}>
+                        <div className="flex justify-between items-center cursor-pointer p-2 rounded-lg transition-all duration-300 ease-in-out hover:bg-opacity-80 hover:shadow-md active:bg-opacity-70" onClick={() => toggleSection('overview')}>
+                            <div className="flex items-center gap-4 flex-wrap">
+                                <h2 className={`text-2xl font-semibold ${titleTextColorClass}`}>Vue d'Ensemble Financière</h2>
+                                {/* Progress bar moved here */}
+                                <div className="w-48 h-2 rounded-full bg-gray-200 dark:bg-gray-700 relative overflow-hidden">
+                                    <div
+                                        className="bg-gradient-to-r from-blue-500 to-blue-600 h-full rounded-full transition-all duration-500 ease-out"
+                                        style={{ width: `${Math.min(100, overallProgress)}%` }}
+                                    ></div>
+                                    <span className={`absolute inset-0 flex items-center justify-center text-xs font-bold ${isDarkMode ? 'text-gray-100' : 'text-gray-900'}`}>
+                                        {overallProgress.toFixed(0)}%
+                                    </span>
+                                </div>
+                            </div>
+                            <svg className={`h-6 w-6 transform transition-transform duration-300 ${openSections.overview ? 'rotate-90' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                            </svg>
+                        </div>
+                        <div className={`collapsible-content ${openSections.overview ? 'open' : ''} mt-4`}>
+                            {/* Objectif Global Card */}
+                            <div className={`p-6 rounded-xl shadow-lg border mb-6 ${cardBgClass}`}>
+                                <h3 className={`text-xl font-semibold mb-4 ${titleTextColorClass}`}>Objectif Global</h3>
+                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-lg">
+                                    <div className={`p-3 rounded-lg ${isDarkMode ? 'bg-gray-900' : 'bg-gray-50'}`}>
+                                        <label htmlFor="initialCapital" className={`block text-sm font-medium ${labelTextColorClass}`}>Capital Initial (MGA):</label>
+                                        <input
+                                            type="number"
+                                            id="initialCapital"
+                                            value={initialCapital}
+                                            onChange={handleInitialCapitalChange}
+                                            className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                            placeholder={formatMGA(DEFAULT_INITIAL_CAPITAL)}
+                                        />
+                                    </div>
+                                    <div className={`p-3 rounded-lg ${isDarkMode ? 'bg-gray-900' : 'bg-gray-50'}`}>
+                                        <label htmlFor="targetCapital" className={`block text-sm font-medium ${labelTextColorClass}`}>Objectif Final (MGA):</label>
+                                        <input
+                                            type="number"
+                                            id="targetCapital"
+                                            value={targetCapital}
+                                            onChange={handleTargetCapitalChange}
+                                            className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                            placeholder={formatMGA(DEFAULT_TARGET_CAPITAL)}
+                                        />
+                                    </div>
+                                    <div className={`p-3 rounded-lg ${isDarkMode ? 'bg-gray-900' : 'bg-gray-50'}`}>
+                                        <p className={`${labelTextColorClass}`}>Capital Actuel (MGA):</p>
+                                        <p className={`font-bold ${gridValuePurpleClass}`}>{formatMGA(currentTotalCapital)}</p>
+                                    </div>
+                                </div>
+                                <div className="mt-4 text-sm">
+                                    <p className={labelTextColorClass}>ID Utilisateur: <span className="font-mono text-xs break-all">{userId || 'Non authentifié'}</span></p>
+                                </div>
+                                <button
+                                    onClick={handleResetAllSettings}
+                                    className={`mt-6 w-full font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-300 ease-in-out transform hover:scale-105 hover:shadow-lg active:scale-95 active:brightness-90 ${buttonSecondaryClass}`}
+                                >
+                                    Réinitialiser tous les paramètres
+                                </button>
+                            </div>
+
+                            {/* Carte Résumé Mensuel */}
+                            <div className={`p-6 rounded-xl shadow-lg border mb-6 ${cardBgClass}`}>
+                                <h3 className={`text-xl font-semibold mb-4 ${titleTextColorClass}`}>Résumé Mensuel</h3>
+                                <div className="scrollable-table-container max-h-64">
+                                    <table className={`min-w-full rounded-lg overflow-hidden ${isDarkMode ? 'bg-gray-800' : 'bg-white'}`}>
+                                        <thead className="sticky-header"><tr>
+                                            <th className="py-2 px-4 rounded-tl-lg">Mois</th>
+                                            <th className="py-2 px-4">Revenus (MGA)</th>
+                                            <th className="py-2 px-4">Dépenses (MGA)</th>
+                                            <th className="py-2 px-4">P&L Trading (MGA)</th> {/* New column */}
+                                            <th className="py-2 px-4 rounded-tr-lg">Épargne Nette (MGA)</th>
+                                        </tr></thead>
+                                        <tbody>
+                                            {Object.entries(monthlySummaries).sort(([a], [b]) => a.localeCompare(b)).map(([month, data]) => (
+                                                <tr key={month} className={`border-b ${tableRowBgClass}`}>
+                                                    <td className={`py-2 px-4 text-sm ${valueTextColorClass}`}>{new Date(month).toLocaleString('fr-MG', { month: 'long', year: 'numeric' })}</td>
+                                                    <td className={`py-2 px-4 text-sm ${getProfitLossColorClass(data.income)}`}>{formatMGA(data.income)}</td>
+                                                    <td className={`py-2 px-4 text-sm ${getProfitLossColorClass(data.expense * -1)}`}>{formatMGA(data.expense)}</td>
+                                                    <td className={`py-2 px-4 text-sm ${getProfitLossColorClass(data.tradingProfitLoss)}`}>{formatMGA(data.tradingProfitLoss)}</td> {/* Display trading P&L */}
+                                                    <td className="py-2 px-4 text-sm font-medium">
+                                                        <span className={getNetSavingsColorClass(data.netSavings)}>
+                                                            {formatMGA(data.netSavings)}
+                                                        </span>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                                <div className={`mt-4 text-lg font-semibold ${valueTextColorClass}`}>
+                                    <p>Épargne Nette Totale: <span className={`font-bold ${getNetSavingsColorClass(totalNetSavings)}`}>{formatMGA(totalNetSavings)}</span></p>
+                                    {/* Added totalAmountInvested here */}
+                                    <p>Montant Total Investi: <span className={`font-bold ${getNetSavingsColorClass(totalAmountInvested)}`}>{formatMGA(totalAmountInvested)}</span></p>
+                                </div>
+                            </div>
+
+                            {/* Section pour les revenus et dépenses mensuels fixes */}
+                            <div className={`p-6 rounded-xl shadow-lg border ${cardBgClass}`}>
+                                <h3 className={`text-xl font-semibold mb-4 ${cardBlueTitleClass}`}>Revenus et Dépenses Mensuels Fixes</h3>
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                    <div>
+                                        <label htmlFor="fixedMonthlyIncome" className={`block text-sm font-medium ${labelTextColorClass}`}>Salaire Mensuel Fixe (MGA):</label>
+                                        <input
+                                            type="number"
+                                            id="fixedMonthlyIncome"
+                                            value={fixedMonthlyIncome}
+                                            onChange={handleFixedMonthlyIncomeChange}
+                                            className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                            placeholder={formatMGA(DEFAULT_FIXED_MONTHLY_INCOME)}
+                                        />
+                                    </div>
+                                    <div>
+                                        <label htmlFor="fixedMonthlyExpense" className={`block text-sm font-medium ${labelTextColorClass}`}>Dépenses Mensuelles Fixes (MGA):</label>
+                                        <input
+                                            type="number"
+                                            id="fixedMonthlyExpense"
+                                            value={fixedMonthlyExpense}
+                                            onChange={handleFixedMonthlyExpenseChange}
+                                            className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                            placeholder={formatMGA(DEFAULT_FIXED_MONTHLY_EXPENSE)}
+                                        />
+                                    </div>
+                                </div>
+                                <div className={`mt-4 text-lg font-semibold ${valueTextColorClass}`}>
+                                    <p>Épargne Mensuelle Fixe Estimée: <span className={getNetSavingsColorClass(estimatedFixedMonthlyNet)}>{formatMGA(estimatedFixedMonthlyNet)}</span></p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Section: Gestion des Flux de Trésorerie */}
+                    <div className={`p-6 rounded-xl shadow-lg border ${cardBgClass}`}>
+                        <div className="flex justify-between items-center cursor-pointer p-2 rounded-lg transition-all duration-300 ease-in-out hover:bg-opacity-80 hover:shadow-md active:bg-opacity-70" onClick={() => toggleSection('cashFlow')}>
+                            <div className="flex items-center gap-4 flex-wrap">
+                                <h2 className={`text-2xl font-semibold ${titleTextColorClass}`}>Gestion des Flux de Trésorerie</h2>
+                                {/* New Flow Bar */}
+                                <div className="w-64 h-6 rounded-full bg-gray-200 dark:bg-gray-700 relative overflow-hidden flex">
+                                    {incomeFlowPercentage > 0 && (
+                                        <div
+                                            className={`h-full transition-all duration-500 ease-out bg-blue-500 flex items-center justify-center ${
+                                                expenseFlowPercentage === 0 ? 'rounded-full' : 'rounded-l-full'
+                                            }`}
+                                            style={{ width: `${incomeFlowPercentage}%` }}
+                                        >
+                                            <span className="text-xs font-bold text-white">{incomeFlowPercentage.toFixed(0)}%</span>
+                                        </div>
+                                    )}
+                                    {expenseFlowPercentage > 0 && (
+                                        <div
+                                            className={`h-full transition-all duration-500 ease-out bg-red-500 flex items-center justify-center ${
+                                                incomeFlowPercentage === 0 ? 'rounded-full' : 'rounded-r-full'
+                                            }`}
+                                            style={{ width: `${expenseFlowPercentage}%` }}
+                                        >
+                                            <span className="text-xs font-bold text-white">{expenseFlowPercentage.toFixed(0)}%</span>
+                                        </div>
+                                    )}
+                                    {totalCurrentMonthFlow === 0 && (
+                                        <div className="h-full w-full flex items-center justify-center text-xs font-semibold text-gray-500 dark:text-gray-400">
+                                            0%
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                            <svg className={`h-6 w-6 transform transition-transform duration-300 ${openSections.cashFlow ? 'rotate-90' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                            </svg>
+                        </div>
+                        <div className={`collapsible-content ${openSections.cashFlow ? 'open' : ''} mt-4`}>
+                            {/* Ajout d'Entrée Quotidienne */}
+                            <div className={`p-6 rounded-xl shadow-lg border mb-6 ${cardBgClass}`}>
+                                <h3 className={`text-xl font-semibold mb-4 ${cardGreenTitleClass}`}>Ajouter une Entrée Quotidienne</h3>
+                                <form onSubmit={handleAddDailyEntry} className="space-y-4">
+                                    <div>
+                                        <label htmlFor="entryDate" className={`block text-sm font-medium ${labelTextColorClass}`}>Date</label>
+                                        <input
+                                            type="date"
+                                            id="entryDate"
+                                            value={entryDate}
+                                            onChange={(e) => setEntryDate(e.target.value)}
+                                            className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                            required
+                                        />
+                                    </div>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                        <div>
+                                            <label htmlFor="incomeAmount" className={`block text-sm font-medium ${labelTextColorClass}`}>Revenu (MGA)</label>
+                                            <input
+                                                type="number"
+                                                id="incomeAmount"
+                                                value={incomeAmount}
+                                                onChange={(e) => setIncomeAmount(e.target.value)}
+                                                className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                                placeholder="0"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label htmlFor="incomeCategory" className={`block text-sm font-medium ${labelTextColorClass}`}>Catégorie Revenu</label>
+                                            <input
+                                                type="text"
+                                                id="incomeCategory"
+                                                value={incomeCategory}
+                                                onChange={(e) => setIncomeCategory(e.target.value)}
+                                                className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                                placeholder="Ex: Salaire, Freelance"
+                                            />
+                                        </div>
+                                    </div>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                        <div>
+                                            <label htmlFor="expenseAmount" className={`block text-sm font-medium ${labelTextColorClass}`}>Dépense (MGA)</label>
+                                            <input
+                                                type="number"
+                                                id="expenseAmount"
+                                                value={expenseAmount}
+                                                onChange={(e) => setExpenseAmount(e.target.value)}
+                                                className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                                placeholder="0"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label htmlFor="expenseCategory" className={`block text-sm font-medium ${labelTextColorClass}`}>Catégorie Dépense</label>
+                                            <input
+                                                type="text"
+                                                id="expenseCategory"
+                                                value={expenseCategory}
+                                                onChange={(e) => setExpenseCategory(e.target.value)}
+                                                className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                                placeholder="Ex: Loyer, Internet"
+                                            />
+                                        </div>
+                                    </div>
+                                    <button
+                                        type="submit"
+                                        className={`w-full font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-300 ease-in-out transform hover:scale-105 hover:shadow-lg active:scale-95 active:brightness-90 ${buttonPrimaryClass}`}
+                                    >
+                                        Ajouter/Mettre à jour l'entrée
+                                    </button>
+                                </form>
+                            </div>
+
+                            {/* Tableau de Suivi Quotidien */}
+                            <div className={`p-6 rounded-xl shadow-lg border ${cardBgClass}`}>
+                                <h3 className={`text-xl font-semibold mb-4 ${titleTextColorClass}`}>Suivi Quotidien</h3>
+                                <div ref={dailyEntriesRef} className="scrollable-table-container">
+                                    <table className={`min-w-full rounded-lg overflow-hidden ${isDarkMode ? 'bg-gray-800' : 'bg-white'}`}>
+                                        <thead className="sticky-header"><tr>
+                                            <th className="py-2 px-4 rounded-tl-lg">Date</th>
+                                            <th className="py-2 px-4">Revenu (MGA)</th>
+                                            <th className="py-2 px-4">Catégorie Rev.</th>
+                                            <th className="py-2 px-4">Dépense (MGA)</th>
+                                            <th className="py-2 px-4">Catégorie Dép.</th>
+                                        </tr></thead>
+                                        <tbody>
+                                            {dailyEntries.map((entry) => (
+                                                <tr key={entry.id} className={`border-b ${tableRowBgClass}`}>
+                                                    <td className={`py-2 px-4 text-sm ${valueTextColorClass}`}>{entry.date}</td>
+                                                    <td className={`py-2 px-4 text-sm ${getProfitLossColorClass(entry.income)}`}>{formatMGA(entry.income)}</td>
+                                                    <td className={`py-2 px-4 text-sm ${valueTextColorClass}`}>{entry.incomeCategory}</td>
+                                                    <td className={`py-2 px-4 text-sm ${getProfitLossColorClass(entry.expense * -1)}`}>{formatMGA(entry.expense)}</td>
+                                                    <td className={`py-2 px-4 text-sm ${valueTextColorClass}`}>{entry.expenseCategory}</td>
+                                                </tr>
+                                            ))}
+                                            {dailyEntries.length === 0 && (
+                                                <tr>
+                                                    <td colSpan="5" className={`py-4 text-center ${labelTextColorClass}`}>
+                                                        Aucune entrée quotidienne pour le moment. Ajoutez-en une !
+                                                    </td>
+                                                </tr>
+                                            )}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Section: Gestion des Investissements */}
+                    <div className={`p-6 rounded-xl shadow-lg border ${cardBgClass}`}>
+                        <div className="flex justify-between items-center cursor-pointer p-2 rounded-lg transition-all duration-300 ease-in-out hover:bg-opacity-80 hover:shadow-md active:bg-opacity-70" onClick={() => toggleSection('investments')}>
+                            <h2 className={`text-2xl font-semibold ${titleTextColorClass}`}>Gestion des Investissements</h2>
+                            <svg className={`h-6 w-6 transform transition-transform duration-300 ${openSections.investments ? 'rotate-90' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                            </svg>
+                        </div>
+                        <div className={`collapsible-content ${openSections.investments ? 'open' : ''} mt-4`}>
+                            {/* Ajout/Mise à jour d'Investissement */}
+                            <div className={`p-6 rounded-xl shadow-lg border mb-6 ${cardBgClass}`}>
+                                <h3 className={`text-xl font-semibold mb-4 ${cardPurpleTitleClass}`}>Ajouter/Mettre à jour Investissement</h3>
+                                <form onSubmit={handleAddInvestment} className="space-y-4">
+                                    <div>
+                                        <label htmlFor="investmentAsset" className={`block text-sm font-medium ${labelTextColorClass}`}>Actif (Crypto/Autre)</label>
+                                        <input
+                                            type="text"
+                                            id="investmentAsset"
+                                            value={investmentAsset}
+                                            onChange={(e) => setInvestmentAsset(e.target.value)}
+                                            className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                            placeholder="Ex: Bitcoin, Ethereum"
+                                            required
+                                        />
+                                    </div>
+                                    <div>
+                                        <label htmlFor="investedAmount" className={`block text-sm font-medium ${labelTextColorClass}`}>Montant Total Investi (MGA)</label>
+                                        <input
+                                            type="number"
+                                            id="investedAmount"
+                                            value={investedAmount}
+                                            onChange={(e) => setInvestedAmount(e.target.value)}
+                                            className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                            placeholder="0"
+                                            required
+                                        />
+                                    </div>
+                                    <button
+                                        type="submit"
+                                        className={`w-full font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-300 ease-in-out transform hover:scale-105 hover:shadow-lg active:scale-95 active:brightness-90 ${buttonPrimaryClass}`}
+                                    >
+                                        Ajouter/Mettre à jour l'investissement
+                                    </button>
+                                </form>
+                            </div>
+
+                            {/* Tableau de Suivi des Investissements */}
+                            <div className={`p-6 rounded-xl shadow-lg border ${cardBgClass}`}>
+                                <h3 className={`text-xl font-semibold mb-4 ${cardYellowTitleClass}`}>Portefeuille d'Investissements</h3>
+                                <div className="scrollable-table-container">
+                                    <table className={`min-w-full rounded-lg overflow-hidden ${isDarkMode ? 'bg-gray-800' : 'bg-white'}`}>
+                                        <thead className="sticky-header">
+                                            <tr>
+                                                <th className="py-2 px-4 rounded-tl-lg">Actif</th>
+                                                <th className="py-2 px-4 rounded-tr-lg">Investi (MGA)</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {investments.map((inv) => (
+                                                <tr key={inv.id} className={`border-b ${tableRowBgClass}`}>
+                                                    <td className={`py-2 px-4 text-sm font-medium ${valueTextColorClass}`}>{inv.assetName}</td>
+                                                    <td className={`py-2 px-4 text-sm ${valueTextColorClass}`}>{formatMGA(inv.totalInvested)}</td>
+                                                </tr>
+                                            ))}
+                                            {investments.length === 0 && (
+                                                <tr>
+                                                    <td colSpan="2" className={`py-4 text-center ${labelTextColorClass}`}>
+                                                        Aucun investissement enregistré. Ajoutez-en un !
+                                                    </td>
+                                                </tr>
+                                            )}
+                                        </tbody>
+                                    </table>
+                                </div>
+                                <div className={`mt-4 text-lg font-semibold ${valueTextColorClass}`}>
+                                    <p>Montant Total Investi: <span className={getNetSavingsColorClass(totalAmountInvested)}>{formatMGA(totalAmountInvested)}</span></p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Section: Journal et Analyse de Trading */}
+                    <div className={`p-6 rounded-xl shadow-lg border ${cardBgClass}`}>
+                        <div className="flex justify-between items-center cursor-pointer p-2 rounded-lg transition-all duration-300 ease-in-out hover:bg-opacity-80 hover:shadow-md active:bg-opacity-70" onClick={() => toggleSection('trading')}>
+                            <div className="flex items-center gap-4 flex-wrap">
+                                <h2 className={`text-2xl font-semibold ${titleTextColorClass}`}>Journal et Analyse de Trading</h2>
+                                {/* New Trading P/L Bar */}
+                                <div className="w-64 h-6 rounded-full bg-gray-200 dark:bg-gray-700 relative overflow-hidden flex">
+                                    {profitPercentage > 0 && (
+                                        <div
+                                            className={`h-full transition-all duration-500 ease-out bg-green-500 flex items-center justify-center ${
+                                                lossPercentage === 0 ? 'rounded-full' : 'rounded-l-full'
+                                            }`}
+                                            style={{ width: `${profitPercentage}%` }}
+                                        >
+                                            <span className="text-xs font-bold text-white">{profitPercentage.toFixed(0)}%</span>
+                                        </div>
+                                    )}
+                                    {lossPercentage > 0 && (
+                                        <div
+                                            className={`h-full transition-all duration-500 ease-out bg-red-500 flex items-center justify-center ${
+                                                profitPercentage === 0 ? 'rounded-full' : 'rounded-r-full'
+                                            }`}
+                                            style={{ width: `${lossPercentage}%` }}
+                                        >
+                                            <span className="text-xs font-bold text-white">{lossPercentage.toFixed(0)}%</span>
+                                        </div>
+                                    )}
+                                    {absoluteTotalTrading === 0 && (
+                                        <div className="h-full w-full flex items-center justify-center text-xs font-semibold text-gray-500 dark:text-gray-400">
+                                            0%
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                            <svg className={`h-6 w-6 transform transition-transform duration-300 ${openSections.trading ? 'rotate-90' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                            </svg>
+                        </div>
+                        <div className={`collapsible-content ${openSections.trading ? 'open' : ''} mt-4`}>
+                            {/* Journal de Trading */}
+                            <div className={`p-6 rounded-xl shadow-lg border mb-6 ${cardBgClass}`}>
+                                <h3 className={`text-xl font-semibold mb-4 ${cardOrangeTitleClass}`}>Journal de Trading</h3>
+                                <form onSubmit={handleAddTrade} className="space-y-4 mb-6">
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                        <div>
+                                            <label htmlFor="tradeAssetType" className={`block text-sm font-medium ${labelTextColorClass}`}>Type d'Actif</label>
+                                            <select
+                                                id="tradeAssetType"
+                                                value={tradeAssetType}
+                                                onChange={(e) => setTradeAssetType(e.target.value)} // Added onChange for completeness, though it's disabled
+                                                className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                                disabled
+                                            >
+                                                <option value="CFD">CFD</option>
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label htmlFor="tradeSymbol" className={`block text-sm font-medium ${labelTextColorClass}`}>Symbole</label>
+                                            <select
+                                                id="tradeSymbol"
+                                                value={tradeSymbol}
+                                                onChange={(e) => setTradeSymbol(e.target.value)}
+                                                className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                                required
+                                            >
+                                                {Object.entries(ASSET_SYMBOLS).map(([groupName, symbols]) => (
+                                                    <optgroup key={groupName} label={groupName}>
+                                                        {symbols.map(symbol => (
+                                                            <option key={symbol} value={symbol}>{symbol}</option>
+                                                        ))}
+                                                    </optgroup>
+                                                ))}
+                                            </select>
+                                        </div>
+                                    </div>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                        <div>
+                                            <label htmlFor="tradeQuantity" className={`block text-sm font-medium ${labelTextColorClass}`}>Quantité</label>
+                                            <input
+                                                type="number"
+                                                id="tradeQuantity"
+                                                value={tradeQuantity}
+                                                onChange={(e) => setTradeQuantity(e.target.value)}
+                                                className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                                placeholder="0"
+                                                step="any"
+                                                required
+                                            />
+                                        </div>
+                                        <div>
+                                            <label htmlFor="tradeType" className={`block text-sm font-medium ${labelTextColorClass}`}>Type</label>
+                                            <select
+                                                id="tradeType"
+                                                value={tradeType}
+                                                onChange={(e) => setTradeType(e.target.value)}
+                                                className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                                required
+                                            >
+                                                <option value="profit">Profit</option>
+                                                <option value="loss">Perte</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <label htmlFor="tradeAmount" className={`block text-sm font-medium ${labelTextColorClass}`}>Montant (MGA)</label>
+                                        <input
+                                            type="number"
+                                            id="tradeAmount"
+                                            value={tradeAmount}
+                                            onChange={(e) => setTradeAmount(e.target.value)}
+                                            className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                            placeholder="0"
+                                            step="any"
+                                            required
+                                        />
+                                    </div>
+                                    <div>
+                                        <label htmlFor="tradeDate" className={`block text-sm font-medium ${labelTextColorClass}`}>Date du Trade</label>
+                                        <input
+                                            type="date"
+                                            id="tradeDate"
+                                            value={tradeDate}
+                                            onChange={(e) => setTradeDate(e.target.value)}
+                                            className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                            required
+                                        />
+                                    </div>
+                                    <div>
+                                        <label htmlFor="tradeNotes" className={`block text-sm font-medium ${labelTextColorClass}`}>Notes</label>
+                                        <textarea
+                                            id="tradeNotes"
+                                            value={tradeNotes}
+                                            onChange={(e) => setTradeNotes(e.target.value)}
+                                            className={`mt-1 block w-full rounded-md shadow-sm p-2 ${inputClass}`}
+                                            placeholder="Ex: Bonne entrée, sortie prématurée, etc."
+                                            rows="2"
+                                        ></textarea>
+                                    </div>
+                                    <button
+                                        type="submit"
+                                        className={`w-full font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-300 ease-in-out transform hover:scale-105 hover:shadow-lg active:scale-95 active:brightness-90 ${buttonPrimaryClass}`}
+                                    >
+                                        Ajouter Trade
+                                    </button>
+                                </form>
+
+                                <h3 className={`text-xl font-semibold mb-3 ${titleTextColorClass}`}>Historique des Trades</h3>
+                                <div ref={tradesRef} className="scrollable-table-container max-h-80 mb-6">
+                                    <table className={`min-w-full rounded-lg overflow-hidden ${isDarkMode ? 'bg-gray-800' : 'bg-white'}`}>
+                                        <thead className="sticky-header"><tr>
+                                            <th className="py-2 px-4 rounded-tl-lg">Date</th>
+                                            <th className="py-2 px-4">Type</th>
+                                            <th className="py-2 px-4">Symbole</th>
+                                            <th className="py-2 px-4">Qté</th>
+                                            <th className="py-2 px-4 rounded-tr-lg">P&L (MGA)</th>
+                                            <th className="py-2 px-4">Notes</th>
+                                        </tr></thead>
+                                        <tbody>
+                                            {trades.map((trade) => (
+                                                <tr key={trade.id} className={`border-b ${tableRowBgClass}`}>
+                                                    <td className={`py-2 px-4 text-sm ${valueTextColorClass}`}>{trade.tradeDate}</td>
+                                                    <td className={`py-2 px-4 text-sm ${valueTextColorClass}`}>{trade.assetType}</td>
+                                                    <td className={`py-2 px-4 text-sm ${valueTextColorClass}`}>{trade.symbol}</td>
+                                                    <td className={`py-2 px-4 text-sm ${valueTextColorClass}`}>{trade.quantity.toLocaleString('fr-MG')}</td>
+                                                    <td className="py-2 px-4 text-sm font-semibold">
+                                                        <span className={getProfitLossColorClass(trade.profitLoss)}>
+                                                            {formatMGA(trade.profitLoss)}
+                                                        </span>
+                                                    </td>
+                                                    <td className={`py-2 px-4 text-sm ${valueTextColorClass}`}>{trade.notes}</td>
+                                                </tr>
+                                            ))}
+                                            {trades.length === 0 && (
+                                                <tr>
+                                                    <td colSpan="6" className={`py-4 text-center ${labelTextColorClass}`}>
+                                                        Aucun trade enregistré pour le moment. Ajoutez-en un !
+                                                    </td>
+                                                </tr>
+                                            )}
+                                        </tbody>
+                                    </table>
+                                </div>
+                                <div className={`mt-4 text-lg font-semibold ${valueTextColorClass}`}>
+                                    <p>Profit/Perte Total Trading: <span className={getProfitLossColorClass(totalTradingProfitLoss)}>{formatMGA(totalTradingProfitLoss)}</span></p>
+                                </div>
+
+                                <h3 className={`text-xl font-semibold mt-8 mb-3 ${titleTextColorClass}`}>Performance par Actif</h3>
+                                <div className="w-full h-64">
+                                    <ResponsiveContainer width="100%" height="100%">
+                                        <BarChart
+                                            data={tradePerformanceData}
+                                            margin={{ top: 5, right: 30, left: 20, bottom: 5 }}
+                                        >
+                                            <CartesianGrid strokeDasharray="3 3" stroke={isDarkMode ? '#4A5568' : '#E2E8F0'} />
+                                            <XAxis dataKey="symbol" stroke={isDarkMode ? '#CBD5E0' : '#4A5568'} />
+                                            <YAxis stroke={isDarkMode ? '#CBD5E0' : '#4A5568'} />
+                                            <Tooltip
+                                                formatter={(value) => formatMGA(value)}
+                                                contentStyle={{
+                                                    backgroundColor: isDarkMode ? '#2D3748' : '#FFFFFF',
+                                                    borderColor: isDarkMode ? '#4A5568' : '#E2E8F0',
+                                                    color: isDarkMode ? '#E2E8F0' : '#2D3748'
+                                                }}
+                                                itemStyle={{ color: isDarkMode ? '#E2E8F0' : '#2D3748' }}
+                                            />
+                                            <Legend />
+                                            <Bar dataKey="profitLoss" name="Profit/Perte" fill={isDarkMode ? '#60A5FA' : '#3B82F6'} /> {/* Bleu en sombre et clair pour cohérence */}
+                                        </BarChart>
+                                    </ResponsiveContainer>
+                                </div>
+                            </div>
+
+                            {/* Graphique de trading en direct (Gold seulement) */}
+                            <div className={`p-6 rounded-xl shadow-lg border ${cardBgClass}`}>
+                                <h3 className={`text-xl font-semibold mb-4 ${cardTealTitleClass}`}>Graphique de Trading en Direct: Gold (XAUUSD)</h3>
+                                <TradingChartWidget symbol="XAUUSD" isDarkMode={isDarkMode} />
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Section: Outils d'Intelligence Artificielle & Actions */}
+                    <div className={`p-6 rounded-xl shadow-lg border ${cardBgClass}`}>
+                        <div className="flex justify-between items-center cursor-pointer p-2 rounded-lg transition-all duration-300 ease-in-out hover:bg-opacity-80 hover:shadow-md active:bg-opacity-70" onClick={() => toggleSection('aiTools')}>
+                            <h2 className={`text-2xl font-semibold ${titleTextColorClass}`}>Outils d'Intelligence Artificielle & Actions</h2>
+                            <svg className={`h-6 w-6 transform transition-transform duration-300 ${openSections.aiTools ? 'rotate-90' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                            </svg>
+                        </div>
+                        <div className={`collapsible-content ${openSections.aiTools ? 'open' : ''} mt-4`}>
+                            {/* Idées & Actions */}
+                            <div className={`p-6 rounded-xl shadow-lg border mb-6 ${cardBgClass}`}>
+                                <h3 className={`text-xl font-semibold mb-4 ${cardOrangeTitleClass}`}>Idées & Actions</h3>
+                                <div className={`prose max-w-none ${valueTextColorClass}`}>
+                                    <p>Utilise cet espace pour noter tes idées de revenus supplémentaires, tes recherches d'investissement, et les actions à entreprendre cette semaine.</p>
+                                    <ul className="list-disc list-inside space-y-2">
+                                        <li>**Idées de Side Hustles :** (Ex: Cours de X, vente de Y, création de Z)</li>
+                                        <li>**Cryptos / Investissements à explorer :** (Ex: Projet A, Altcoin B, Action C)</li>
+                                        <li>**Formations à suivre : (Ex: tutoriel sur le trading, livre sur l'entrepreneuriat)**</li>
+                                        <li>**Actions à prendre cette semaine :** (Ex: Contacter 3 clients potentiels, ouvrir un compte d'échange crypto)</li>
+                                    </ul>
+                                    <textarea
+                                        className={`mt-4 w-full h-32 rounded-md shadow-sm p-3 ${inputClass}`}
+                                        placeholder="Écris tes idées et actions ici..."
+                                    ></textarea>
+                                </div>
+                            </div>
+
+                            {/* Conseils de l'IA */}
+                            <div className={`p-6 rounded-xl shadow-lg border ${cardBgClass}`}>
+                                <h3 className={`text-xl font-semibold mb-4 ${cardTealTitleClass}`}>Conseils de l'IA pour booster vos finances</h3>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <button
+                                            onClick={generateIncomeIdeas}
+                                            className={`w-full font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-300 ease-in-out transform hover:scale-105 hover:shadow-lg active:scale-95 active:brightness-90 flex items-center justify-center ${buttonPrimaryClass}`}
+                                            disabled={incomeIdeasLoading}
+                                        >
+                                            {incomeIdeasLoading ? (
+                                                <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                                </svg>
+                                            ) : (
+                                                <>Générer des Idées de Revenus ✨</>
+                                            )}
+                                        </button>
+                                        {incomeIdeasResponse && (
+                                            <div className={`mt-4 p-4 rounded-lg border text-sm whitespace-pre-wrap ${aiResponseBgClass}`}>
+                                                {incomeIdeasResponse}
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div>
+                                        <button
+                                            onClick={generateInvestmentAdvice}
+                                            className={`w-full font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-300 ease-in-out transform hover:scale-105 hover:shadow-lg active:scale-95 active:brightness-90 flex items-center justify-center ${buttonPrimaryClass}`}
+                                            disabled={investmentAdviceLoading}
+                                        >
+                                            {investmentAdviceLoading ? (
+                                                <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                                </svg>
+                                            ) : (
+                                                <>Conseils d'Investissement ✨</>
+                                            )}
+                                        </button>
+                                        {investmentAdviceResponse && (
+                                            <div className={`mt-4 p-4 rounded-lg border text-sm whitespace-pre-wrap ${aiResponseBgClass}`}>
+                                                {investmentAdviceResponse}
+                                            </div>
+                                        )}
+                                    </div>
+                                    {/* Nouveau bouton pour l'analyse de trading */}
+                                    <div className="col-span-full">
+                                        <button
+                                            onClick={generateTradeAnalysis}
+                                            className={`w-full font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-300 ease-in-out transform hover:scale-105 hover:shadow-lg active:scale-95 active:brightness-90 flex items-center justify-center ${buttonPrimaryClass}`}
+                                            disabled={tradeAnalysisLoading}
+                                        >
+                                            {tradeAnalysisLoading ? (
+                                                <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                                </svg>
+                                            ) : (
+                                                <>Analyse de Performance Trading ✨</>
+                                            )}
+                                        </button>
+                                        {tradeAnalysisResponse && (
+                                            <div className={`mt-4 p-4 rounded-lg border text-sm whitespace-pre-wrap ${aiResponseBgClass}`}>
+                                                {tradeAnalysisResponse}
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Section: Résumé Financier Global (Pie Chart) - Toujours affiché */}
+                    <div className={`p-6 rounded-xl shadow-lg border ${cardBgClass}`}>
+                        <h2 className={`text-2xl font-semibold mb-4 ${titleTextColorClass}`}>Résumé Financier Global</h2>
+                        <div className="w-full h-80">
+                            {pieChartData.length > 0 ? (
+                                <ResponsiveContainer width="100%" height="100%">
+                                    <PieChart>
+                                        <Pie
+                                            data={pieChartData}
+                                            cx="50%"
+                                            cy="50%"
+                                            innerRadius={60}
+                                            outerRadius={100}
+                                            fill="#8884d8"
+                                            paddingAngle={5}
+                                            dataKey="value"
+                                            stroke={isDarkMode ? '#1A1A1A' : '#FFFFFF'} // Border color for slices
+                                            strokeWidth={2}
+                                            animationDuration={500}
+                                        >
+                                            {pieChartData.map((entry, index) => (
+                                                <Cell key={`cell-${index}`} fill={MARVEL_COLORS[index % MARVEL_COLORS.length]} />
+                                            ))}
+                                        </Pie>
+                                        <Tooltip content={<CustomPieTooltip isDarkMode={isDarkMode} />} />
+                                        <Legend />
+                                    </PieChart>
+                                </ResponsiveContainer>
+                            ) : (
+                                <p className={`text-center py-8 ${labelTextColorClass}`}>
+                                    Aucune donnée financière pour le résumé global. Ajoutez des entrées !
+                                </p>
+                            )}
+                        </div>
+                    </div>
+
+                </div>
+            )} {/* Fin du conteneur principal des sections */}
+
+            {showAllSections && (
+                <footer className={`text-center text-sm mt-8 ${labelTextColorClass}`}>
+                    <p>&copy; 2025 Plan Financier. Tous droits réservés.</p>
+                </footer>
+            )}
+        </div>
+    );
+};
+
+export default App;
